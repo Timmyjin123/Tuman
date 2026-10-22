@@ -137,13 +137,30 @@ struct Ctx {
     int tick = 1;          // half-rate toggle (1 = process this sample)
     bool halfRate = false; // hidden "long" mode
     bool alt = true;       // hidden alternate mode (gates in Pump / Wavefolder)
-    float hrIn = 0.0f;     // last mono input stored on skipped half-rate samples
-    float hrPrev[4]{};     // previous wet outputs for half-rate interpolation
+    // half-rate ("long" mode) bookkeeping shared by algorithms 0-7
+    float hrSum = 0.0f;            // input L+R stored on the skipped sample
+    float hrNew[2]{}, hrOld[2]{};  // last two wet outputs
     Noise noise;
     Limiter lim;
     std::vector<int16_t> shared;   // 60000-sample int16 recording memory
     Ctx() : shared(60008, 0) {}
 };
+
+// Half-rate helpers. On the skipped sample the input is remembered and the output
+// interpolates the last two wet values; on the processed sample the input is the
+// average of both and the output is delayed by one processed step.
+inline float hrInput(Ctx& c, float sum) { return c.halfRate ? (c.hrSum + sum) * 0.5f : sum; }
+inline void hrSkip(Ctx& c, float sum, float& wl, float& wr) {
+    c.hrSum = sum;
+    wl = (c.hrOld[0] + c.hrNew[0]) * 0.5f;
+    wr = (c.hrOld[1] + c.hrNew[1]) * 0.5f;
+}
+inline void hrCommit(Ctx& c, float& wl, float& wr) {
+    float pl = c.hrNew[0], pr = c.hrNew[1];
+    c.hrNew[0] = wl; c.hrNew[1] = wr;
+    if (c.halfRate) { wl = pl; wr = pr; }
+    c.hrOld[0] = pl; c.hrOld[1] = pr;
+}
 
 // Mix law used by most algorithms: dry/wet with a mid-position bump.
 inline float mixBump(float m, float c) { return (1.0f - m) * m * c + 1.0f; }

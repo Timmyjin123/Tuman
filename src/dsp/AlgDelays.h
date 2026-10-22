@@ -121,7 +121,163 @@ struct AlgLoFiDelay {
     }
 };
 
-struct AlgMicroLoops { void process(Ctx& c, float l, float r, float& ol, float& orr) { ol = c.lim(l); orr = c.lim(r); } };
-struct AlgMicroLoopsVerb { void process(Ctx& c, float l, float r, float& ol, float& orr) { ol = c.lim(l); orr = c.lim(r); } };
+// Three loop heads playing fixed regions of the shared memory while a write head
+// sweeps backwards through all of it (overdub with feedback = P4), so the loops
+// slowly renew themselves. Loop lengths follow P1..P3 with a very slow glide.
+struct LoopBank {
+    float sm[3]{};                  // slowly smoothed length knobs
+    float gain[3] = { 0, 0, 0 };    // per-loop duck when its knob is turned down quickly
+    int timer[3]{};
+    int w = 0, pos[3]{};
+    float env = 1.0f;
+
+    static int wrap(int i) { if (i >= 59997) i -= 59997; return i; }
+    static int wrap2(int i) { if (i >= 59997) i -= 59997; if (i < 0) i += 59997; return i; }
+
+    void smooth(const Ctx& c, float duckFall) {
+        for (int i = 0; i < 3; ++i) {
+            float k = c.k[1 + i];
+            sm[i] = sm[i] + (sm[i] - k) * -0.000300000014f;
+            float d = sm[i] - k;
+            if (d >= 0.0700000077f) {
+                gain[i] = gain[i] + (gain[i] + duckFall) * -0.00100000005f;
+                timer[i] = 35000;
+            } else if (timer[i] > 0) {
+                --timer[i];
+            } else {
+                gain[i] = gain[i] + (gain[i] + -1.00010002f) * -0.00100000005f;
+            }
+        }
+    }
+    int len(int i) const { return (int32_t)((sm[i] * 59996.0f) * 0.930000007f) + 3600; }
+
+    float head(const Ctx& c, int i, int base) const {
+        const int r = pos[i], L = len(i);
+        auto rd = [&](int idx) { return (float)c.shared[idx]; };
+        if (r < 1800) {
+            float f = (float)r / 1800.0f;
+            float a = (i == 0) ? rd(r) : rd(wrap(base + r));
+            float b = rd(wrap(L + r + base + 1));
+            float h = f * 0.5f;
+            return b * (0.5f - h) + (h + 0.5f) * a;
+        }
+        if (L - 1800 < r) {
+            float f = (float)(r - L + 1800) / 1800.0f;
+            float cc = rd(wrap2(r - L + 1800 - 1801 + base));
+            float a = rd(wrap(base + r));
+            float h = f * 0.5f;
+            return a * (1.0f - h) + h * cc;
+        }
+        return rd(wrap(base + r));
+    }
+
+    void heads(const Ctx& c, float& l1, float& l2, float& l3) const {
+        l1 = head(c, 0, 0); l2 = head(c, 1, 19997); l3 = head(c, 2, 39994);
+    }
+    void advance(Ctx& c) {
+        if (w == 0) { c.shared[59997] = c.shared[0]; w = 59996; } else --w;
+        for (int i = 0; i < 3; ++i) pos[i] = pos[i] > 0 ? pos[i] - 1 : len(i);
+    }
+    static int16_t q16(float v) {
+        int32_t q = (int32_t)v;
+        return (int16_t)(q < -32767 ? -32767 : (q > 32767 ? 32767 : q));
+    }
+    // returns wet L/R (already /25000); sum = L+R input (gain applied inside)
+    void run(Ctx& c, float sum, float& wl, float& wr) {
+        float l1, l2, l3; heads(c, l1, l2, l3);
+        float mid = (l2 * gain[1]) * 0.75f;
+        float L = mid + l1 * gain[0];
+        float R = mid + l3 * gain[2];
+        wl = L / 25000.0f; wr = R / 25000.0f;
+        float old = (float)c.shared[w];
+        float x = (sum * 0.5f) * c.gain + (old / 25000.0f) * c.k[4];
+        float lvl = std::fabs(x * 1.10000002f + (sum * 0.25f) * c.gain);
+        if (env < lvl) env = env + (env - lvl) * -0.100000001f;
+        else env = env + (env + -1.0f) * -0.000300000014f;
+        c.shared[w] = q16((x / env) * 25000.0f);
+        advance(c);
+    }
+    void reset() { w = 0; pos[0] = pos[1] = pos[2] = 0; env = 1.0f; }
+};
+
+struct AlgMicroLoops {
+    LoopBank bank;
+    void process(Ctx& c, float inL, float inR, float& outL, float& outR) {
+        bank.smooth(c, -0.100000001f);
+        float wl = 0.0f, wr = 0.0f;
+        if (c.state != 2) {
+            if (c.state == 3) { bank.reset(); c.state = 4; }
+            float sum = inL + inR;
+            if (c.tick == 0) hrSkip(c, sum, wl, wr);
+            else {
+                bank.run(c, hrInput(c, sum), wl, wr);
+                hrCommit(c, wl, wr);
+            }
+        }
+        float dry = 1.0f - c.k[0];
+        float bump = (dry * c.k[0]) * 1.70000005f + 1.0f;
+        outL = c.lim(((wl * c.gain) * c.k[0] + dry * inL) * bump);
+        outR = c.lim(((wr * c.gain) * c.k[0] + dry * inR) * bump);
+    }
+};
+// Micro Loops Reverb: the same three loops, but the write head also feeds back a
+// chorus-modulated read of the freshly written material (negative feedback = diffusion)
+// plus the loop mix itself; the loop output gets its own AGC.
+struct AlgMicroLoopsVerb {
+    LoopBank bank;
+    float inEnv = 1.0f, outEnv = 1.0f, dc = 0.0f;
+    float tri = 0.0f, triStep = 4.4e-05f;
+    void process(Ctx& c, float inL, float inR, float& outL, float& outR) {
+        bank.smooth(c, -0.0399999991f);
+        float wl = 0.0f, wr = 0.0f;
+        if (c.state != 2) {
+            if (c.state == 3) { bank.reset(); outEnv = 1.0f; inEnv = 1.0f; dc = 0.0f; c.state = 4; }
+            float sum = inL + inR;
+            if (c.tick == 0) hrSkip(c, sum, wl, wr);
+            else {
+                sum = hrInput(c, sum);
+                float l1, l2, l3; bank.heads(c, l1, l2, l3);
+                float a = l1 * bank.gain[0], b = l2 * bank.gain[1];
+                float mid = b * 0.75f;
+                float L = (mid + a) / 25000.0f;
+                float cc = l3 * bank.gain[2];
+                float R = (mid + cc) / 25000.0f;
+                // modulated read just behind the write head
+                float pos = (float)bank.w + tri * -100.0f;
+                if (pos < 0.0f) pos = (pos + 59996.0f) + 1.0f;
+                int32_t i = (int32_t)pos;
+                float fr = pos - (float)i;
+                float v = (float)c.shared[i] * (1.0f - fr);
+                v = v + (float)c.shared[i + 1] * fr;
+                float x = (sum * 0.5f) * c.gain;
+                float fb = c.k[4];
+                float y = x - (v / 25000.0f) * fb;
+                float side = ((a - b) + cc) / 25000.0f;
+                y = y + (side * fb) * 0.5f;
+                dc = dc + (dc - y) * -0.000500000024f;
+                y = y - dc;
+                float lvl = std::fabs(x + y * 1.10000002f);
+                if (inEnv < lvl) inEnv = inEnv + (inEnv - lvl) * -0.100000001f;
+                else inEnv = inEnv + (inEnv + -1.0f) * -0.000300000014f;
+                c.shared[bank.w] = LoopBank::q16((y / inEnv) * 25000.0f);
+                bank.advance(c);
+                float t = tri + triStep;
+                if (t >= 1.00000012f) triStep = -triStep;
+                if (t < 0.0f) { t = 0.0f; triStep = -triStep; }
+                tri = t;
+                float pk = std::fabs(L), pr = std::fabs(R);
+                pk = (pr < pk) ? pk * 1.20000005f : pr * 1.20000005f;
+                if (outEnv < pk) outEnv = outEnv + (outEnv - pk) * -0.100000001f;
+                else outEnv = outEnv + (outEnv + -1.0f) * -0.000300000014f;
+                wl = L / outEnv; wr = R / outEnv;
+                hrCommit(c, wl, wr);
+            }
+        }
+        float m = c.k[0], dry = 1.0f - m;
+        float bump = (dry * m) * 1.70000005f + 1.0f;
+        outL = c.lim(((wl * c.gain) * m + dry * inL) * bump);
+        outR = c.lim(((wr * c.gain) * m + dry * inR) * bump);
+    }
+};
 
 } // namespace tuman
