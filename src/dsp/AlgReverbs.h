@@ -127,6 +127,106 @@ struct AlgInfinity {
 };
 
 struct AlgLush { void background(Ctx&) {} void process(Ctx& c, float l, float r, float& ol, float& orr) { ol = c.lim(l); orr = c.lim(r); } };
-struct AlgGenerative { void process(Ctx& c, float l, float r, float& ol, float& orr) { ol = c.lim(l); orr = c.lim(r); } };
+// Generative: four delay lines (two pairs swept in opposite directions by slow
+// triangles) mixed through a lossless-ish 4x4 matrix; every line passes a DC
+// blocker (P1), two resonant band-pass "singing" filters (P3) and a low-pass (P2).
+// P4 is the decay; with high P3 the filters self-excite and the reverb generates
+// its own tones, kept in check by two level followers.
+struct AlgGenerative {
+    std::vector<float> m = std::vector<float>(16384, 0.0f);
+    uint32_t ptr = 0;
+    float lpA[4]{}, hpA[4]{}, dc[2]{}, lpo[2]{};
+    float sweep[2] = { 0, 0 }, step[2] = { 4.4e-06f, 5.5e-06f };
+    float env1 = 1.0f, env2 = 1.0f;
+    FilterBP bp;
+
+    float& at(uint32_t i) { return m[i & 0x3fff]; }
+    float tap(uint32_t base, float off) {
+        int32_t io = (int32_t)off;
+        float fr = off - (float)(uint32_t)io;
+        uint32_t r = (uint32_t)io + base;
+        float v = (1.0f - fr) * at(r);
+        return v + at(r + 1) * fr;
+    }
+
+    void process(Ctx& c, float inL, float inR, float& outL, float& outR) {
+        const float mix = c.k[0];
+        const float hpc = (c.k[1] * c.k[1]) * 0.100000001f + 0.000500000024f;
+        const float lpc = (c.k[2] * c.k[2]) * 0.99000001f + 0.00999999978f;
+        const float res = c.k[3] * 0.600000024f;
+        const float inv = 1.0f - c.k[4];
+        float in = ((inL + inR) * 0.5f) * c.gain;
+        float wl = 0.0f, wr = 0.0f;
+        if (c.state != 2) {
+            if (c.state == 3) {
+                for (int i = 0; i < 4; ++i) { lpA[i] = hpA[i] = 0.0f; }
+                dc[0] = dc[1] = lpo[0] = lpo[1] = 0.0f;
+                ptr = 0; env1 = env2 = 1.0f; c.state = 4;
+            }
+            if (c.tick == 0) hrSkip(c, in, wl, wr);
+            else {
+                in = hrInput(c, in);
+                float v1 = tap(ptr, sweep[0] * 1100.0f);
+                float v2 = tap(ptr + 0x7d0, sweep[1] * 880.0f);
+                float v3 = tap(ptr + 0x143c, (1.0f - sweep[0]) * 1100.0f);
+                float v4 = tap(ptr + 0x2508, (1.0f - sweep[1]) * 880.0f);
+                float k = (1.0f - inv * inv) / env1;
+                float a = v4 + v1 * 0.300000012f;
+                float b = v2 + v3 * 0.300000012f;
+                float cc = v3 + v4 * 0.300000012f;
+                float d = v1 + v2 * 0.300000012f;
+                float x = in * 0.5f;
+                float y[4];
+                y[0] = x + ((cc * -0.300000012f) - d) * k;
+                y[1] = ((a * 0.300000012f) - b) * k - x;
+                y[2] = x + ((d * 0.300000012f) - cc) * k;
+                y[3] = ((b * -0.300000012f) - a) * k - x;
+                const float f1 = hpc / 3.14159274f, f2 = lpc / 3.14159274f;
+                for (int i = 0; i < 4; ++i) {
+                    hpA[i] = hpA[i] + (y[i] - hpA[i]) * hpc;
+                    float s = y[i] - hpA[i];
+                    s = s + bp(i, s, f1, 0.075000003f) * res;
+                    lpA[i] = lpA[i] + (s - lpA[i]) * lpc;
+                    y[i] = lpA[i] + (bp(i + 4, s, f2, 0.0549999997f) * res) * 2.0f;
+                }
+                at(ptr + 0x7d0) = -(y[0] * c.gain);
+                at(ptr + 0x143c) = y[1] * c.gain;
+                at(ptr + 0x2508) = -(y[2] * c.gain);
+                at(ptr + 0x3f0c) = y[3] * c.gain;
+                for (int i = 0; i < 2; ++i) {
+                    sweep[i] = sweep[i] + step[i];
+                    if (sweep[i] >= 1.00000012f) step[i] = -step[i];
+                    if (sweep[i] < 0.0f) { step[i] = -step[i]; sweep[i] = 0.0f; }
+                }
+                float ol = v1 * 0.899999976f; ol = ol + v3 * 0.800000012f;
+                float orr = v2 + v4 * 0.800000012f;
+                dc[0] = dc[0] + (ol - dc[0]) * hpc;
+                ol = ol - dc[0];
+                ol = ol + (bp(8, ol * 0.25f, f1, 0.075000003f) * res) * 4.0f;
+                lpo[0] = lpo[0] + (ol - lpo[0]) * lpc;
+                ol = lpo[0] + (bp(9, ol * 0.25f, f2, 0.0549999997f) * res) * 8.0f;
+                dc[1] = dc[1] + (orr - dc[1]) * hpc;
+                orr = orr - dc[1];
+                orr = orr + (bp(10, orr * 0.25f, f1, 0.075000003f) * res) * 4.0f;
+                lpo[1] = lpo[1] + (orr - lpo[1]) * lpc;
+                orr = lpo[1] + (bp(11, orr * 0.25f, f2, 0.0549999997f) * res) * 8.0f;
+                ptr = (ptr + 1) & 0x3fff;
+                float lvl = std::fabs(ol + orr);
+                if (env1 < lvl) env1 = env1 + (env1 - lvl) * -0.0500000007f;
+                else env1 = env1 + (env1 + -1.0f) * -0.000300000014f;
+                float al = std::fabs(ol), ar = std::fabs(orr);
+                float pk = (ar < al) ? al * 1.20000005f : ar * 1.20000005f;
+                if (env2 < pk) env2 = env2 + (env2 - pk) * -0.00999999978f;
+                else env2 = env2 + (env2 + -1.0f) * -0.000300000014f;
+                wl = ol / env2; wr = orr / env2;
+                hrCommit(c, wl, wr);
+            }
+        }
+        float dry = 1.0f - mix;
+        float bump = (dry * mix) * 1.70000005f + 1.0f;
+        outL = c.lim(((((wl * c.gain) * mix) * 0.800000012f) + dry * inL) * bump);
+        outR = c.lim(((((wr * c.gain) * mix) * 0.800000012f) + dry * inR) * bump);
+    }
+};
 
 } // namespace tuman
