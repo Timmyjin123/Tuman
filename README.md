@@ -7,6 +7,8 @@
 
 Личный исследовательский проект, не для распространения.
 
+![UI](docs/ui.png)
+
 ## Установка
 
 1. Открой страницу **Releases** этого репозитория и скачай `Tuman-mac.zip` из последнего релиза.
@@ -76,6 +78,8 @@ GitHub Actions (`.github/workflows/build.yml`) собирает universal-бин
 cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build --target Tuman_VST3 Tuman_AU
 ```
+
+Шрифты интерфейса — Space Grotesk и Space Mono (SIL Open Font License, `assets/fonts/OFL.txt`).
 
 `tools/render_demo.cpp` — офлайн-рендер демо-WAV по всем алгоритмам без JUCE
 (`tuman_render <папка> [вход.wav]`). `tools/ref_render.cpp` — эталонный рендер для сверки.

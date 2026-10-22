@@ -37,6 +37,11 @@ target_sources(Tuman PRIVATE
     src/PluginProcessor.cpp
     src/PluginEditor.cpp)
 
+juce_add_binary_data(TumanAssets SOURCES
+    assets/fonts/SpaceGrotesk-Bold.ttf
+    assets/fonts/SpaceMono-Regular.ttf
+    assets/fonts/SpaceMono-Bold.ttf)
+
 target_include_directories(Tuman PRIVATE src)
 
 target_compile_definitions(Tuman PUBLIC
@@ -58,6 +63,7 @@ endif()
 
 target_link_libraries(Tuman
     PRIVATE
+        TumanAssets
         juce::juce_audio_utils
         juce::juce_dsp
     PUBLIC
@@ -70,3 +76,13 @@ add_executable(tuman_render tools/render_demo.cpp)
 target_compile_options(tuman_render PRIVATE -ffp-contract=off)
 add_executable(tuman_ref tools/ref_render.cpp)
 target_compile_options(tuman_ref PRIVATE -ffp-contract=off)
+
+option(TUMAN_BUILD_SNAPSHOT "Build the UI snapshot tool (dev only)" OFF)
+if(TUMAN_BUILD_SNAPSHOT)
+    juce_add_console_app(tuman_snapshot PRODUCT_NAME "tuman_snapshot")
+    target_sources(tuman_snapshot PRIVATE tools/snapshot.cpp src/PluginProcessor.cpp src/PluginEditor.cpp)
+    target_include_directories(tuman_snapshot PRIVATE src)
+    target_compile_definitions(tuman_snapshot PRIVATE JUCE_WEB_BROWSER=0 JUCE_USE_CURL=0 JUCE_STANDALONE_APPLICATION=1)
+    target_compile_options(tuman_snapshot PRIVATE -ffp-contract=off)
+    target_link_libraries(tuman_snapshot PRIVATE TumanAssets juce::juce_audio_utils juce::juce_recommended_config_flags)
+endif()

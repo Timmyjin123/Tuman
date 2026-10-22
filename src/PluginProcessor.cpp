@@ -96,6 +96,7 @@ TumanProcessor::TumanProcessor()
     pLong = apvts.getRawParameterValue("long");
     pGate = apvts.getRawParameterValue("gate");
     engine = std::make_unique<tuman::Engine>();
+    setCurrentProgram(0);   // start on the first factory preset
 }
 
 bool TumanProcessor::isBusesLayoutSupported(const BusesLayout& layouts) const {

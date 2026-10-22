@@ -2,56 +2,115 @@
 #include <juce_audio_utils/juce_audio_utils.h>
 #include "PluginProcessor.h"
 
+// "Brushed aluminium" hardware panel. Everything is laid out on a fixed 960x540
+// panel that the editor scales as a whole when the window is resized.
 namespace tuman_ui {
-struct Palette {
-    static juce::Colour bg()    { return juce::Colour(0xff0f1114); }
-    static juce::Colour panel() { return juce::Colour(0xff171a1f); }
-    static juce::Colour line()  { return juce::Colour(0xff2a2e36); }
-    static juce::Colour text()  { return juce::Colour(0xffe6e2da); }
-    static juce::Colour dim()   { return juce::Colour(0xff7b818c); }
+
+struct Ink {
+    static juce::Colour panel()  { return juce::Colour(0xffd8d5cd); }
+    static juce::Colour ink()    { return juce::Colour(0xff17181a); }
+    static juce::Colour rule()   { return juce::Colour(0xffb9b5ac); }
+    static juce::Colour cap()    { return juce::Colour(0xff1b1c1e); }
+    static juce::Colour capIn()  { return juce::Colour(0xff232426); }
+    static juce::Colour paper()  { return juce::Colour(0xfff2efe8); }
+    static juce::Colour muted()  { return juce::Colour(0xff8e8a82); }
+    static juce::Colour label()  { return juce::Colour(0xff4a4b4e); }
     static juce::Colour group(const juce::String& g) {
-        if (g == "reverb")  return juce::Colour(0xff6fa8dc);
-        if (g == "delay")   return juce::Colour(0xff7cc489);
-        if (g == "special") return juce::Colour(0xffe2c65a);
-        return juce::Colour(0xffe0675a);
+        if (g == "reverb")  return juce::Colour(0xff2f6db5);
+        if (g == "delay")   return juce::Colour(0xff2e8a4e);
+        if (g == "special") return juce::Colour(0xffc9a227);
+        return juce::Colour(0xffc2412f);
     }
 };
 
-class LookAndFeel : public juce::LookAndFeel_V4 {
+struct Type {
+    static juce::Font mono(float pt, bool bold = false, float tracking = 0.0f);
+    static juce::Font grotesk(float pt, float tracking = 0.0f);
+};
+
+class PanelLookAndFeel : public juce::LookAndFeel_V4 {
 public:
-    LookAndFeel();
-    juce::Colour accent { Palette::group("reverb") };
+    PanelLookAndFeel();
     void drawRotarySlider(juce::Graphics&, int x, int y, int w, int h, float pos, float a0, float a1, juce::Slider&) override;
-    void drawToggleButton(juce::Graphics&, juce::ToggleButton&, bool, bool) override;
-    void drawComboBox(juce::Graphics&, int w, int h, bool, int, int, int, int, juce::ComboBox&) override;
-    juce::Font getComboBoxFont(juce::ComboBox&) override;
+    juce::Font getPopupMenuFont() override { return Type::mono(13.0f); }
 };
 
-class Knob : public juce::Component {
+// 15-position rotary selector with printed labels around it
+class Selector : public juce::Component {
 public:
-    Knob(juce::AudioProcessorValueTreeState& s, const juce::String& id, const juce::String& label, bool big);
-    void setLabel(const juce::String& l) { label = l; repaint(); }
-    void resized() override;
-    void paint(juce::Graphics&) override;
-    juce::Slider slider;
-private:
-    juce::String label; bool big;
-    std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> att;
-};
-
-class AlgList : public juce::Component {
-public:
-    explicit AlgList(juce::AudioProcessorValueTreeState& s) : state(s) {}
+    explicit Selector(juce::AudioProcessorValueTreeState& s);
     void paint(juce::Graphics&) override;
     void mouseDown(const juce::MouseEvent&) override;
+    void mouseDrag(const juce::MouseEvent&) override;
+    void mouseUp(const juce::MouseEvent&) override;
     void mouseMove(const juce::MouseEvent&) override;
     void mouseExit(const juce::MouseEvent&) override { hover = -1; repaint(); }
-    int selected = 0, active = 0, hover = -1;
+    void mouseWheelMove(const juce::MouseEvent&, const juce::MouseWheelDetails&) override;
+    int alg = 0;
 private:
     juce::AudioProcessorValueTreeState& state;
-    int rowAt(float y) const;
-    float rowH() const { return (float)getHeight() / (float)tuman::kNumAlgs; }
+    juce::Point<float> centre { 230.0f, 285.0f };
+    int hover = -1; bool dragging = false; float wheelAcc = 0.0f;
+    int labelAt(juce::Point<float>) const;
+    juce::Rectangle<float> labelBox(int i) const;
+    void choose(int i);
 };
+
+class ToggleSwitch : public juce::ToggleButton {
+public:
+    using juce::ToggleButton::ToggleButton;
+    void paintButton(juce::Graphics&, bool over, bool down) override;
+};
+
+// "IN -3 dB" printed value; drag vertically to change, double-click resets
+class DbReadout : public juce::Slider {
+public:
+    explicit DbReadout(juce::String c) : caption(std::move(c)) {
+        setSliderStyle(juce::Slider::RotaryVerticalDrag);
+        setTextBoxStyle(juce::Slider::NoTextBox, false, 0, 0);
+        setMouseDragSensitivity(220);
+        setMouseCursor(juce::MouseCursor::UpDownResizeCursor);
+    }
+    void paint(juce::Graphics&) override;
+private:
+    juce::String caption;
+};
+
+class PresetButton : public juce::Component {
+public:
+    explicit PresetButton(TumanProcessor& p) : proc(p) { setMouseCursor(juce::MouseCursor::PointingHandCursor); }
+    void paint(juce::Graphics&) override;
+    void mouseDown(const juce::MouseEvent&) override;
+private:
+    TumanProcessor& proc;
+};
+
+class Panel : public juce::Component {
+public:
+    explicit Panel(TumanProcessor&);
+    ~Panel() override;
+    void paint(juce::Graphics&) override;
+    void refresh(int alg, bool clip);
+    static constexpr int W = 960, H = 540;
+private:
+    TumanProcessor& proc;
+    PanelLookAndFeel lnf;
+    juce::Image surface;
+    Selector selector;
+    juce::Slider mix, p[4];
+    DbReadout inDb { "IN" }, outDb { "OUT" };
+    ToggleSwitch longSw { "LONG" }, gateSw { "GATE" };
+    PresetButton preset;
+    using SA = juce::AudioProcessorValueTreeState::SliderAttachment;
+    using BA = juce::AudioProcessorValueTreeState::ButtonAttachment;
+    std::unique_ptr<SA> mixAtt, pAtt[4], inAtt, outAtt;
+    std::unique_ptr<BA> longAtt, gateAtt;
+    int shown = -1; bool led = false;
+    juce::String knobLabel[4];
+    static juce::Image makeBrushedSurface(int scale);
+    void setupKnob(juce::Slider&, bool big);
+};
+
 } // namespace tuman_ui
 
 class TumanEditor : public juce::AudioProcessorEditor, private juce::Timer {
@@ -62,15 +121,7 @@ public:
     void resized() override;
 private:
     void timerCallback() override;
-    void refreshForAlgorithm(int alg);
     TumanProcessor& proc;
-    tuman_ui::LookAndFeel lnf;
-    tuman_ui::AlgList algList;
-    std::unique_ptr<tuman_ui::Knob> mix, p[4], inK, outK;
-    juce::ToggleButton longBtn { "Long" }, gateBtn { "Gate" };
-    std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> longAtt, gateAtt;
-    juce::ComboBox presets;
-    int shownAlg = -1;
-    float inMeter = 0, outMeter = 0; bool led = false;
+    tuman_ui::Panel panel;
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(TumanEditor)
 };
