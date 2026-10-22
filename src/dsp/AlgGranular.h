@@ -152,6 +152,95 @@ struct AlgShimmer {
     }
 };
 
-struct AlgGrainVerb { void process(Ctx& c, float l, float r, float& ol, float& orr) { ol = c.lim(l); orr = c.lim(r); } };
+// Granular Reverb: two sets of four 400 ms grains; every grain plays its region
+// forwards AND backwards at once (the reverse read fades near the write head).
+// P2 crossfades forward/reverse, P3 shapes the feedback, P4 feedback amount,
+// P1 a bipolar tone on the signal written back into memory.
+struct AlgGrainVerb {
+    int w = 0, ph = 0;
+    int slot[8]{};
+    float envIn = 1.0f, envOut = 1.0f, fbLp = 0.0f, dc = 0.0f, lp = 0.0f, hpS = 0.0f;
+
+    static int wrapNeg(int p) { return p < 0 ? p + 18721 : p; }
+    static float tri(int p) { return (float)(p < 9361 ? p : 18720 - p) / 9360.0f; }
+
+    void grainPair(Ctx& c, int p, int& sl, float& fwd, float& rev) {
+        p = wrapNeg(p);
+        if (p == 0) sl = (int32_t)(c.noise.next() * 59996.0f);
+        fwd = (float)c.shared[grain::wrapIdx(sl + p)] * tri(p);
+        int r = 18720 - p;
+        int idx = grain::wrapIdx(r + sl);
+        float v = (float)c.shared[idx] * tri(r);
+        rev = ((float)grain::headDist(idx, w) / 500.0f) * v;
+    }
+
+    void process(Ctx& c, float inL, float inR, float& outL, float& outR) {
+        float wl = 0.0f, wr = 0.0f;
+        if (c.state != 2) {
+            if (c.state == 3) {
+                for (int& s : slot) s = 0;
+                w = ph = 0; envIn = envOut = 1.0f;
+                fbLp = dc = lp = hpS = 0.0f;
+                c.state = 4;
+            }
+            float hp = hpS;
+            float sum = inL + inR;
+            if (c.tick == 0) hrSkip(c, sum, wl, wr);
+            else {
+                sum = hrInput(c, sum);
+                float f, r;
+                grainPair(c, ph, slot[0], f, r); float aF = f, aR = r;
+                grainPair(c, ph - 4680, slot[1], f, r); aF = aF - f; aR = aR - r;
+                grainPair(c, ph - 9360, slot[2], f, r); aF = aF + f; aR = aR + r;
+                grainPair(c, ph - 14040, slot[3], f, r); aF = aF - f; aR = aR - r;
+                grainPair(c, ph, slot[4], f, r); float bF = f, bR = r;
+                grainPair(c, ph - 4680, slot[5], f, r); bF = bF - f; bR = bR - r;
+                grainPair(c, ph - 9360, slot[6], f, r); bF = bF + f; bR = bR + r;
+                grainPair(c, ph - 14040, slot[7], f, r); bF = bF - f; bR = bR - r;
+                const float p1 = c.k[1], p2 = c.k[2], p3 = c.k[3];
+                float shape = (0.5f - std::fabs(p2 + -0.5f)) * 0.75f + 1.0f;
+                float fw = 1.0f - p2;
+                float L = (fw * aF + aR * p2) * shape;
+                float R = (fw * bF + bR * p2) * shape;
+                wl = L / 25000.0f; wr = R / 25000.0f;
+                fbLp = fbLp + (fbLp - (wl + wr)) * -0.899999976f;
+                float old = (float)c.shared[w] / 25000.0f;
+                float back = ((fbLp * 0.620000005f) * p3) + (p3 + -1.0f) * old;
+                back = back * c.k[4];
+                float sh3 = (0.5f - std::fabs(p3 + -0.5f)) * 0.75f + 1.0f;
+                float x = ((sum * 0.5f) * c.gain) + (back * sh3) * 1.20000005f;
+                dc = dc + (dc - x) * -0.000500000024f;
+                float y = x - dc;
+                float hc = 0.0f, lc = 1.0f;
+                if (p1 >= 0.550000072f) hc = (p1 + -0.550000012f) * 0.111110002f;
+                else hp = hpS * 0.999000013f;
+                if (p1 < 0.449999988f) lc = (p1 + -0.449999988f) * 1.88888001f + 1.0f;
+                hp = hp + (y - hp) * hc;
+                y = y + hp * -0.5f;
+                lp = lp + (y - lp) * lc;
+                float out = y * 0.300000012f + lp * 0.699999988f;
+                float lvl = std::fabs(out * 1.10000002f + (sum * 0.25f) * c.gain);
+                if (envIn < lvl) envIn = envIn + (envIn - lvl) * -0.100000001f;
+                else envIn = envIn + (envIn + -1.0f) * -0.000300000014f;
+                int32_t q = (int32_t)((out / envIn) * 25000.0f);
+                q = q < -32767 ? -32767 : (q > 32767 ? 32767 : q);
+                c.shared[w] = (int16_t)q;
+                w = w > 0 ? w - 1 : 59996;
+                ph = ph > 0 ? ph - 1 : 18720;
+                float al = std::fabs(wl), ar = std::fabs(wr);
+                float pk = (ar < al) ? al * 1.20000005f : ar * 1.20000005f;
+                if (envOut < pk) envOut = envOut + (envOut - pk) * -0.100000001f;
+                else envOut = envOut + (envOut + -1.0f) * -0.000300000014f;
+                wl = wl / envOut; wr = wr / envOut;
+                hrCommit(c, wl, wr);
+            }
+            hpS = hp;
+        }
+        float m = c.k[0], dry = 1.0f - m;
+        float bump = (dry * m) * 1.70000005f + 1.0f;
+        outL = c.lim((((wl * c.gain) * m) + dry * inL) * bump);
+        outR = c.lim((((wr * c.gain) * m) + dry * inR) * bump);
+    }
+};
 
 } // namespace tuman
