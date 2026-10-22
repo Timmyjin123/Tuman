@@ -27,6 +27,45 @@ struct Noise {
 };
 
 // Output soft limiter: linear to 0.9, parabolic knee up to a 1.0 ceiling.
+// Bays-Durham shuffled LCG (device-global), used to seed the tape's noise generators.
+struct ShuffleRng {
+    bool ready = false;
+    uint32_t seed = 1, last = 0, tab[32]{};
+    static uint32_t step(uint32_t x) { return (x * 1664525u + 1013904223u) % 0x7fffffffu; }
+    uint32_t next() {
+        uint32_t r6 = seed, r7 = last;
+        if (!ready) {
+            for (int i = 0; i < 8; ++i) r6 = step(r6);
+            for (int i = 0; i < 16; ++i) { r6 = step(r6); tab[2 * i] = r6; r6 = step(tab[2 * i]); tab[2 * i + 1] = r6; }
+            r7 = tab[31]; ready = true;
+        }
+        r6 = step(r6);
+        uint32_t j = r7 & 0x1f;
+        uint32_t out = tab[j];
+        tab[j] = r6; last = out; seed = r6;
+        return out & 0x3fffffffu;
+    }
+};
+
+// LFSR pair + slow smoother: a random value redrawn every `period` ticks and glided to.
+struct RandSmooth {
+    uint32_t a = 0, b = 0, out = 0, count = 0, period = 0;
+    float coef = 0.0f, smooth = 0.0f;
+    void seed() { a = 0xabcde; b = 0x23456789; }
+    float raw() const { return (float)out * 2.32830644e-10f; }
+    float tick() {
+        uint32_t old = count; count = old + 1;
+        if (period < old) {
+            uint32_t a1 = (a >> 1) ^ ((a & 1) ? 0xb4bcd35cu : 0u);
+            uint32_t a2 = (a1 >> 1) ^ ((a1 & 1) ? 0xb4bcd35cu : 0u);
+            uint32_t b1 = (b >> 1) ^ ((b & 1) ? 0x7a5bc2e3u : 0u);
+            a = a2; b = b1; out = b1 ^ a2; count = 0;
+        }
+        smooth = smooth + (raw() - smooth) * coef;
+        return smooth;
+    }
+};
+
 struct Limiter {
     int led = 0;
     float operator()(float x) {
@@ -134,13 +173,15 @@ struct Ctx {
     float k[5]{};          // smoothed knobs: mix, p1..p4
     float gain = 1.0f;     // fade gain used during algorithm changes
     uint8_t state = 0;     // 1 fade-out, 2 muted, 3 init request, 4 fade-in, 0 run
-    int tick = 1;          // half-rate toggle (1 = process this sample)
+    int tick = 0;          // half-rate toggle (1 = process this sample)
     bool halfRate = false; // hidden "long" mode
     bool alt = true;       // hidden alternate mode (gates in Pump / Wavefolder)
     // half-rate ("long" mode) bookkeeping shared by algorithms 0-7
     float hrSum = 0.0f;            // input L+R stored on the skipped sample
     float hrNew[2]{}, hrOld[2]{};  // last two wet outputs
     Noise noise;
+    ShuffleRng rng;
+    uint32_t adcExtra[4]{};   // spare ADC channels the device mixes into the tape seeds
     Limiter lim;
     std::vector<int16_t> shared;   // 60000-sample int16 recording memory
     Ctx() : shared(60008, 0) {}

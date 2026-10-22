@@ -16,6 +16,10 @@ int main(int argc, char** argv) {
     e->snapKnobs(k);
     e->forceAlgorithm(alg);
     e->c.gain = 1.0f;
+    if (const char* tt = getenv("TUMAN_TAPE_TABLE")) {   // validation only: exact curve table
+        FILE* tf = fopen(tt, "rb"); float* T = e->tapeTable();
+        size_t n = fread(T, 4, 453, tf); fclose(tf); T[453] = T[452]; (void)n;
+    }
     FILE* f = fopen(argv[15], "rb"); std::vector<float> in;
     float buf[2]; while (fread(buf, 4, 2, f) == 2) { in.push_back(buf[0]); in.push_back(buf[1]); }
     fclose(f);

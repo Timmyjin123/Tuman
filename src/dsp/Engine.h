@@ -97,6 +97,7 @@ private:
 public:
     float algsNyq() const { return algs->nyquist.f0; }
     const AlgNyquist& nyq() const { return algs->nyquist; }
+    float* tapeTable() { return algs->tape.T; }   // test hook
 private:
 
     void smoothKnobs() {
