@@ -1,0 +1,98 @@
+name: Build
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  macos:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Ninja
+        run: brew install ninja
+
+      - name: Cache JUCE
+        uses: actions/cache@v4
+        with:
+          path: build/_deps
+          key: juce-8.0.4-${{ runner.os }}
+
+      - name: Configure
+        run: >
+          cmake -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64"
+          -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0
+
+      - name: Build plugin
+        run: cmake --build build --target Tuman_VST3 Tuman_AU Tuman_Standalone --parallel
+
+      - name: Sign (ad-hoc)
+        run: |
+          A=build/Tuman_artefacts/Release
+          for b in "$A/VST3/Tuman.vst3" "$A/AU/Tuman.component" "$A/Standalone/Tuman.app"; do
+            codesign --force --deep --sign - "$b"
+          done
+          lipo -info "$A/VST3/Tuman.vst3/Contents/MacOS/Tuman"
+
+      - name: Validate AU (auval)
+        run: |
+          mkdir -p ~/Library/Audio/Plug-Ins/Components
+          cp -R build/Tuman_artefacts/Release/AU/Tuman.component ~/Library/Audio/Plug-Ins/Components/
+          killall -9 AudioComponentRegistrar 2>/dev/null || true
+          sleep 2
+          auval -v aufx Tumn Tmjn
+
+      - name: Validate VST3 (pluginval)
+        run: |
+          curl -sL -o pluginval.zip https://github.com/Tracktion/pluginval/releases/download/v1.0.4/pluginval_macOS.zip
+          unzip -q pluginval.zip
+          ./pluginval.app/Contents/MacOS/pluginval --strictness-level 5 --validate-in-process \
+            --skip-gui-tests build/Tuman_artefacts/Release/VST3/Tuman.vst3
+
+      - name: Package
+        run: |
+          A=build/Tuman_artefacts/Release
+          mkdir -p pkg dist
+          cp -R "$A/VST3/Tuman.vst3" "$A/AU/Tuman.component" "$A/Standalone/Tuman.app" pkg/
+          cp tools/install.sh pkg/ && chmod +x pkg/install.sh
+          (cd pkg && ditto -c -k . ../dist/Tuman-mac.zip)
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Tuman-mac
+          path: dist/Tuman-mac.zip
+
+      - name: Release
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v0.1.${{ github.run_number }}
+          name: Tuman 0.1.${{ github.run_number }}
+          target_commitish: ${{ github.sha }}
+          make_latest: true
+          body: |
+            Установка: скачай Tuman-mac.zip ниже, распакуй и запусти install.sh
+            (двойной клик не сработает — в Терминале: bash ~/Downloads/Tuman-mac/install.sh).
+          files: dist/Tuman-mac.zip
+
+  demo-audio:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Render demo WAVs
+        run: |
+          g++ -O2 -std=c++17 -ffp-contract=off -o render tools/render_demo.cpp
+          mkdir -p demo && ./render demo
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Tuman-demo-audio
+          path: demo/*.wav

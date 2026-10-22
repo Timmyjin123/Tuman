@@ -69,10 +69,13 @@ public:
         c.tick = c.halfRate ? 1 - c.tick : 1;
         dispatch(inL, inR, outL, outR);
         // the device runs some slow analysis in its main loop; emulate it at a fixed cadence
-        if (++bgCount >= kBackgroundEvery) { bgCount = 0; if (c.state != 2) background(); }
+        if (++bgCount >= bgEvery[alg]) { bgCount = 0; if (c.state != 2) background(); }
     }
 
-    static constexpr int kBackgroundEvery = 128;
+    // Main-loop cadence per algorithm (in engine samples). The device's main loop is free
+    // running, so light tasks effectively run every sample; the pitch tracker is heavy.
+    int bgEvery[kNumAlgs] = { 1, 1, 1, 1, 1, 1, 1, 1, 1, 256, 1, 1, 1, 1, 1 };
+    void setBackgroundCadence(int n) { for (int& b : bgEvery) b = n; }
     int bgCount = 0;
 
     void background() {

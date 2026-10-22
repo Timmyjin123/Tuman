@@ -10,6 +10,7 @@ int main(int argc, char** argv) {
     int alg = atoi(argv[1]);
     float raw[5], k[5];
     for (int i = 0; i < 5; ++i) { raw[i] = (float)atof(argv[2 + i]); k[i] = (float)atof(argv[7 + i]); }
+    e->setBackgroundCadence(128);   // must match the reference harness
     e->c.halfRate = atoi(argv[12]); e->c.alt = atoi(argv[13]);
     int pre = atoi(argv[14]);
     for (int i = 0; i < 5; ++i) e->setKnobRaw(i, raw[i]);
