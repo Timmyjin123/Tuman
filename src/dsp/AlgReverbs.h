@@ -126,7 +126,228 @@ struct AlgInfinity {
     }
 };
 
-struct AlgLush { void background(Ctx&) {} void process(Ctx& c, float l, float r, float& ol, float& orr) { ol = c.lim(l); orr = c.lim(r); } };
+// Delay line addressed in milliseconds (scale = 46.875 / length), linear interpolation.
+template <typename T>
+struct MsLine {
+    std::vector<T> buf; uint32_t idx = 0, len = 0; float scale = 0;
+    void init(uint32_t n, float sc) { if (buf.size() != n) buf.assign(n, T(0)); len = n; scale = sc; }
+    float val(uint32_t i) const;
+    float read(float ms) const {
+        float L = (float)len;
+        float x = (ms * L) * scale;
+        float d = L + -2.0f;
+        if (d >= x) { d = 2.0f; if (x >= 2.0f) d = x; }
+        float pos = (float)idx - d;
+        if (pos < 0.0f) pos = pos + L;
+        if (pos >= L) pos = 0.0f;
+        uint32_t i = (uint32_t)pos;
+        float fr = pos - (float)i;
+        uint32_t n = (i + 1) % len;
+        return valMix(i, n, fr);
+    }
+    float valMix(uint32_t i, uint32_t n, float fr) const;
+    void write(T v) { buf[idx] = v; idx = (idx + 1) % len; }
+};
+template <> inline float MsLine<float>::valMix(uint32_t i, uint32_t n, float fr) const {
+    float v = (1.0f - fr) * buf[i];
+    return v + buf[n] * fr;
+}
+template <> inline float MsLine<int16_t>::valMix(uint32_t i, uint32_t n, float fr) const {
+    float a = (float)buf[i] * 6.10370189e-05f;
+    float v = a * (1.0f - fr);
+    float b = (float)buf[n] * 6.10370189e-05f;
+    return v + b * fr;
+}
+
+// Quadrature ("magic circle") sine oscillator.
+struct CircleOsc {
+    float s = 1.0f, c = 0.0f, f = 0.0f;
+    void tick() {
+        float t = s - (c * kPi) * f;
+        c = c + (t * kPi) * f;
+        float o = t * 1.00000095f;
+        if (o >= 1.00000012f) o = 1.0f; else if (o < -1.0f) o = -1.0f;
+        s = o;
+    }
+};
+
+// Lush: input diffusion (multi-tap line -> Hadamard with a cubic-saturated branch),
+// four short diffusion lines feeding early reflections, then four long lines
+// (stored as 16-bit, base times 15/40/75/100 ms -> 91/131/201/291 ms with P3)
+// with a Householder feedback matrix whose mixing coefficients are swept by sine
+// LFOs. Delay times wander with a smoothed random walk; P2 sets chorus depth and
+// LFO speed, P1 a tilt tone, P4 decay.
+struct AlgLush {
+    MsLine<float> lin, e[4];
+    MsLine<int16_t> late[4];
+    CircleOsc osc[4];
+    uint32_t lfsrA = 0, lfsrB = 0, rnd = 0, count = 0, period = 1000;
+    float rndSmooth = 0.0f, rndCoef = 0.0001f;
+    float lpA[4]{}, hpB[4]{};
+    float eHpL = 0, eHpR = 0, eLpL = 0, eLpR = 0, p3s = 0, outEnv = 1.0f;
+    float tri = 0.0f, triDir = 1.0f;
+    const float lateTone[2] = { 0.89f, 0.06f }, earlyTone[2] = { 0.89f, 0.06f };
+    bool ready = false;
+
+    void initLines() {
+        lin.init(0x7e0, 0.0232514888f);
+        e[0].init(0x2c0, 0.0665838048f); e[1].init(0x5ae, 0.0322386511f);
+        e[2].init(0x7e0, 0.0232514888f); e[3].init(0xb5b, 0.0161248706f);
+        late[0].init(0x110a, 0.0107462173f); late[1].init(0x185c, 0.00751683768f);
+        late[2].init(0x252e, 0.00492487894f); late[3].init(0x35a8, 0.00341256545f);
+        static const float fr[4] = { 8.53333313e-06f, 8.53333331e-05f, 3.84000032e-06f, 7.47520016e-06f };
+        for (int i = 0; i < 4; ++i) { osc[i].s = 1.0f; osc[i].c = 0.0f; osc[i].f = fr[i]; }
+        lfsrA = 0xabcde; lfsrB = 0x23456789; period = 1000; rndCoef = 0.0001f;
+        ready = true;
+    }
+
+    void background(Ctx& c) {
+        if (!ready) return;
+        float p = c.k[2] * c.k[2];
+        osc[0].f = ((((p * 0.150000006f) / 1.0f) + 0.0500000007f) * 2.0f) / 46875.0f;
+        osc[1].f = ((((p * 2.0f) / 1.0f) + 1.0f) * 2.0f) / 46875.0f;
+        float u = (float)lfsrA;
+        float r = u * 2.32830644e-10f;
+        if (r < 0.160000011f) period = (uint32_t)(r * 90000.0f);
+        else {
+            float t = u * 9.31322588e-11f + 0.600000024f;
+            period = (uint32_t)((t * 0.720000029f + rndSmooth * 0.200000003f) * 90000.0f);
+        }
+    }
+
+    static float sat1(float x) {
+        if (x >= 1.00000012f) x = 1.0f; else if (x < -1.0f) x = -1.0f;
+        return x + (x * x * x) * -0.333333343f;
+    }
+
+    void process(Ctx& c, float inL, float inR, float& outL, float& outR) {
+        if (!ready) initLines();
+        float wl = 0.0f, wr = 0.0f;
+        if (c.state == 3) {
+            for (int i = 0; i < 4; ++i) lpA[i] = hpB[i] = 0.0f;
+            eLpL = 0.0f; initLines();
+            eHpR = eLpR = eHpL = p3s = 0.0f; outEnv = 1.0f;
+            c.state = 4;
+        }
+        if (c.state != 2) {
+            float sum = inR + inL;
+            if (c.tick == 0) hrSkip(c, sum, wl, wr);
+            else {
+                sum = hrInput(c, sum);
+                for (int i = 0; i < 4; ++i) osc[i].tick();
+                float t = tri + triDir * 1.70666663e-05f;
+                if (t >= 1.00000012f) { triDir = -triDir; t = 2.0f - t; }
+                else if (t < 0.0f) { triDir = -triDir; t = -t; }
+                tri = t;
+                // input diffusion
+                float t0 = lin.read(osc[1].s + 9.0f);
+                float t1 = lin.read(osc[0].s + 21.0f);
+                float t2 = lin.read(osc[1].s + 27.0f);
+                float t3 = lin.read(osc[0].s + 41.0f);
+                float sa = sat1(-t1);
+                float A = t2 + -t3, B = t2 - -t3, C = sa + -t0, D = sa - -t0;
+                e[0].write((A + C) * 0.5f);
+                e[1].write((B + D) * 0.5f);
+                e[2].write((A - C) * 0.5f);
+                e[3].write((B - D) * 0.5f);
+                // early reflections
+                float r7 = e[0].read(7.0f), r13 = e[1].read(13.0f), r25 = e[2].read(25.0f), r45 = e[0].read(45.0f);
+                float E = r25 + r45;
+                float eR0 = r7 + E, eL0 = r13 + E;
+                float depth = c.k[2];
+                if (depth >= 0.50000006f) depth = 0.5f; else if (depth < 0.0f) depth = 0.0f;
+                float tw = tri * 0.400000006f;
+                float q0 = e[0].read(14.0f - tw * depth);
+                float q1 = e[1].read(30.0f - tw * depth);
+                float q2 = e[2].read(42.0f - tw * depth);
+                float q3 = e[3].read(61.0f - tw * depth);
+                float s3 = sat1(q3);
+                float P = -q2 + q0, Q = -q2 - q0, R = s3 + q1, S = s3 - q1;
+                float z[4] = { (P + R) * 0.5f, (Q + S) * 0.5f, (P - R) * 0.5f, (Q - S) * 0.5f };
+                float ge = 1.0f - c.k[0];
+                if (ge >= 0.50000006f) ge = 1.0f; else if (ge < 0.0f) ge = 0.5f; else ge = ge + 0.5f;
+                float eL = ((eL0 + z[0]) + z[3]) * ge;
+                float eR = ((eR0 + z[1]) + z[2]) * ge;
+                // tilt tone
+                float p1 = c.k[1], lo, hi;
+                if (p1 >= 0.550000072f) lo = 0.0f; else if (p1 < 0.0f) lo = 1.0f; else lo = 1.0f - p1 * 1.81818175f;
+                hi = p1 + -0.449999988f;
+                if (hi >= 0.550000072f) hi = 1.0f; else if (hi < 0.0f) hi = 0.0f; else hi = hi * 1.81818175f;
+                float hs = hi * hi;
+                float cR = hs * earlyTone[1];
+                eLpR = eLpR + (eR - eLpR) * cR;
+                eHpR = eHpR + ((eLpR - eR) - eHpR) * (1.0f - lo * earlyTone[0]);
+                eLpL = eLpL + (eL - eLpL) * (hs * earlyTone[1]);
+                eHpL = eHpL + ((eLpL - eL) - eHpL) * (1.0f - lo * earlyTone[0]);
+                // late lines
+                float rw = c.k[2];
+                if (rw >= 1.00000012f) rw = 1.0f; else if (rw < 0.5f) rw = 0.5f;
+                float mod = osc[0].c * rw;
+                static const float baseA[4] = { 15.0f, 40.0f, 75.0f, 100.0f }, baseB[4] = { 91.0f, 131.0f, 201.0f, 291.0f };
+                float l[4];
+                uint32_t a = lfsrA, b = lfsrB, cnt = count;
+                for (int i = 0; i < 4; ++i) {
+                    float ms = baseA[i] + (baseB[i] - baseA[i]) * c.k[3];
+                    if (i <= 1) {
+                        uint32_t nxt = cnt + 1;
+                        if (period < cnt) {
+                            uint32_t a1 = (a >> 1) ^ ((a & 1) ? 0xb4bcd35cu : 0u);
+                            a = (a1 >> 1) ^ ((a1 & 1) ? 0xb4bcd35cu : 0u);
+                            b = (b >> 1) ^ ((b & 1) ? 0x7a5bc2e3u : 0u);
+                            rnd = b ^ a;
+                            nxt = 0;
+                        }
+                        float u = (float)rnd * 2.32830644e-10f;
+                        rndSmooth = rndSmooth + (u - rndSmooth) * rndCoef;
+                        ms = ms - (rndSmooth * 5.0f) * rw;
+                        cnt = nxt;
+                    }
+                    l[i] = late[i].read(mod + ms);
+                }
+                count = cnt; lfsrA = a; lfsrB = b;
+                float m0 = (osc[2].s * 0.400000006f) * osc[2].s + 0.600000024f;
+                float m1 = (osc[3].c * 0.699999988f) * osc[3].c + 0.300000012f;
+                float mx = c.k[0], extra;
+                if (mx >= 1.00000012f) extra = 0.125f; else if (mx < 0.5f) extra = 0.0f; else extra = (mx + -0.5f) * 0.25f;
+                float boost = extra / 0.5f + 1.0f;
+                float x0 = (l[0] + m0 * l[2]) + m1 * l[3];
+                float x1 = (l[1] + (1.0f - m0) * l[2]) + (1.0f - m1) * l[3];
+                wl = eHpR + x0 * boost;
+                float h = (((l[0] + l[1]) + l[2]) + l[3]) * -0.5f;
+                float lh[4] = { l[0] + h, l[1] + h, l[2] + h, l[3] + h };
+                p3s = p3s + (c.k[3] - p3s) * 0.00039999999f;
+                float gd = (c.k[4] * 0.5f + 0.5f) - std::fabs(c.k[3] - p3s);
+                if (gd >= 1.00000012f) gd = 1.0f; else if (gd < 0.0f) gd = 0.0f;
+                wr = eHpL + x1 * boost;
+                for (int i = 0; i < 4; ++i) {
+                    float x = z[i] + lh[i] * gd;
+                    lpA[i] = lpA[i] + (x - lpA[i]) * (hs * lateTone[1] + 0.00100000005f);
+                    hpB[i] = hpB[i] + ((lpA[i] - x) - hpB[i]) * (1.0f - lo * lateTone[0]);
+                    float ab = std::fabs(hpB[i]);
+                    float env = 1.0f;
+                    if (env < ab) env = env + (env - ab) * -0.100000001f;
+                    else env = env + (env + -1.0f) * -0.000300000014f;
+                    int32_t q = (int32_t)((hpB[i] / env) * 16383.5f);
+                    if (q >= 0x8000) q = 0x7fff; else if (q < -32767) q = -32767;
+                    late[i].write((int16_t)q);
+                }
+                lin.write((sum * 0.5f) * c.gain);
+                hrCommit(c, wl, wr);
+            }
+        }
+        float m = c.k[0], dry = 1.0f - m;
+        float bump = (dry * m) * 1.66600001f + 1.0f;
+        float gw = c.gain * 0.550000012f;
+        float ol = bump * ((gw * wl) * m + dry * inL);
+        float orr = bump * ((gw * wr) * m + dry * inR);
+        float al = std::fabs(ol), ar = std::fabs(orr);
+        float pk = (ar < al) ? al * 1.20000005f : ar * 1.20000005f;
+        if (outEnv < pk) outEnv = outEnv + (outEnv - pk) * -0.100000001f;
+        else outEnv = outEnv + (outEnv + -1.0f) * -0.000300000014f;
+        outL = c.lim(ol / outEnv);
+        outR = c.lim(orr / outEnv);
+    }
+};
 // Generative: four delay lines (two pairs swept in opposite directions by slow
 // triangles) mixed through a lossless-ish 4x4 matrix; every line passes a DC
 // blocker (P1), two resonant band-pass "singing" filters (P3) and a low-pass (P2).
